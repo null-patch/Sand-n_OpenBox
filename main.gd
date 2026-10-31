@@ -7,11 +7,13 @@ const MAX_PROPS_PER_CHUNK := 150
 const REACH := 80.0
 const SPEED := 6.0
 const JUMP := 6.0
+const SPRINT_MULT := 1.6
 const SAVE_DIR := "user://world"
 const TEX_DIR := "user://textures"
 const LIB_FILE := "user://textures/library.json"
+const SKIN_DIR := "user://skins"
 const MAX_TEX_SIZE := 512
-const TYPE_NAMES := ["Box", "Sphere", "Cylinder"]
+const MODEL_PATH := "res://models/player.glb"
 const PROP_COLORS := [
 	Color(0.9, 0.3, 0.25), Color(0.2, 0.6, 0.9), Color(0.2, 0.8, 0.4),
 	Color(0.95, 0.8, 0.2), Color(0.6, 0.3, 0.8), Color(0.9, 0.9, 0.9)
@@ -23,7 +25,6 @@ const PHYSGUN_STIFFNESS := 18.0
 const PHYSGUN_DAMPING := 6.0
 const PHYSGUN_MAX_ACCELERATION := 80.0
 const PHYSGUN_MAX_SPEED := 24.0
-const SKIN_DIR := "user://skins"
 
 
 var gravity := 9.8
@@ -36,15 +37,13 @@ var player_chunk := Vector2i(-999999, -999999)
 var player: CharacterBody3D
 var head: Node3D
 var camera: Camera3D
-var hud: Label
 var ground_mat: StandardMaterial3D
 var prop_mats: Array = []
 var prop_meshes: Array = []
 var prop_shapes: Array = []
-var current_type := 0
 var mouse_captured := true
 
-var physgun_enabled := false
+var physgun_enabled := true
 var held_prop: RigidBody3D
 var physgun_hold_distance := 10.0
 var prop_transfer_queued := false
@@ -65,16 +64,17 @@ var file_dialog: FileDialog
 
 # Character
 var model: Node3D
-var hips: Node3D
-var head_pivot: Node3D
-var arm_l: Node3D
-var arm_r: Node3D
-var leg_l: Node3D
-var leg_r: Node3D
+var anim: AnimationPlayer
+var anim_idle := ""
+var anim_walk := ""
+var anim_walk_back := ""
+var anim_run := ""
+var anim_jump := ""
+var pose_override := ""        # empty = automatic movement animations
+var sprinting := false
 var third_person := false
-var anim_phase := 0.0
-var body_mats: Array = []     # {"mat": StandardMaterial3D, "color": Color}
-var skin_files: Array = []    # index 0 is always "Default"
+var body_mats: Array = []      # {"mat", "color", "base_tex"} for every retexturable surface
+var skin_files: Array = []     # index 0 is always "Default"
 var skin_index := 0
 
 
@@ -92,6 +92,7 @@ func _ready() -> void:
 	_scan_skins()
 	_apply_skin(0)
 	_build_library_ui()
+
 	var ui: CanvasLayer = preload("res://ui.gd").new()
 	ui.game = self
 	add_child(ui)
@@ -112,24 +113,32 @@ func _process(delta: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
-	var dir := Vector3.ZERO
+	var move := Vector3.ZERO
 	if not library_open:
 		if Input.is_physical_key_pressed(KEY_W):
-			dir.z -= 1
+			move.z -= 1
 		if Input.is_physical_key_pressed(KEY_S):
-			dir.z += 1
+			move.z += 1
 		if Input.is_physical_key_pressed(KEY_A):
-			dir.x -= 1
+			move.x -= 1
 		if Input.is_physical_key_pressed(KEY_D):
-			dir.x += 1
+			move.x += 1
 
-	dir = (player.global_basis * dir).normalized()
-	player.velocity.x = dir.x * SPEED
-	player.velocity.z = dir.z * SPEED
+	# Moving cancels any manually chosen pose.
+	if move != Vector3.ZERO:
+		pose_override = ""
+
+	sprinting = not library_open and move != Vector3.ZERO and Input.is_physical_key_pressed(KEY_SHIFT)
+	var speed := SPEED * (SPRINT_MULT if sprinting else 1.0)
+
+	var dir := (player.global_basis * move).normalized()
+	player.velocity.x = dir.x * speed
+	player.velocity.z = dir.z * speed
 
 	if player.is_on_floor():
 		if Input.is_physical_key_pressed(KEY_SPACE) and not library_open:
 			player.velocity.y = JUMP
+			pose_override = ""
 	else:
 		player.velocity.y -= gravity * delta
 
@@ -139,21 +148,11 @@ func _physics_process(delta: float) -> void:
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_ESCAPE:
-			if library_open:
-				_close_library()
-			else:
-				mouse_captured = not mouse_captured
-				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if mouse_captured else Input.MOUSE_MODE_VISIBLE
-		elif event.keycode == KEY_TAB:
+		if event.keycode == KEY_TAB:
 			if library_open:
 				_close_library()
 			else:
 				_open_library()
-		elif event.keycode == KEY_E and not library_open:
-			current_type = (current_type + 1) % TYPE_NAMES.size()
-		elif event.keycode == KEY_G and not library_open:
-			_toggle_physgun()
 		elif event.keycode == KEY_V and not library_open:
 			_toggle_third_person()
 
@@ -165,7 +164,7 @@ func _input(event: InputEvent) -> void:
 		head.rotate_x(-event.relative.y * 0.0025)
 		head.rotation.x = clampf(head.rotation.x, -1.5, 1.5)
 	elif event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_WHEEL_UP or event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+		if event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
 			if event.pressed and physgun_enabled and is_instance_valid(held_prop):
 				var adjustment := PHYSGUN_SCROLL_STEP
 				if event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
@@ -177,19 +176,13 @@ func _input(event: InputEvent) -> void:
 				)
 			return
 
-		if not event.pressed:
+		if not event.pressed or not physgun_enabled:
 			return
 
 		if event.button_index == MOUSE_BUTTON_LEFT:
-			if physgun_enabled:
-				_grab_at_cursor()
-			else:
-				_spawn_at_cursor()
+			_grab_at_cursor()
 		elif event.button_index == MOUSE_BUTTON_RIGHT:
-			if physgun_enabled:
-				_drop_held_prop()
-			else:
-				_delete_at_cursor()
+			_drop_held_prop()
 
 
 func _notification(what: int) -> void:
@@ -537,53 +530,7 @@ func _prop_material(p: Dictionary) -> Material:
 	return prop_tex_mats[idx]
 
 
-func _spawn_at_cursor() -> void:
-	var hit := _raycast()
-	if hit.is_empty():
-		return
-	var coord := _chunk_of(hit.position)
-	if not chunk_nodes.has(coord):
-		return
-	var data: Dictionary = chunk_data[coord]
-	if data.props.size() >= MAX_PROPS_PER_CHUNK:
-		return
-
-	var local: Vector3 = hit.position + Vector3.UP * 0.6 - _chunk_origin(coord)
-	var p := {
-		"id": data.next_id,
-		"type": current_type,
-		"color": randi() % PROP_COLORS.size(),
-		"tex": prop_tex,
-		"pos": [local.x, local.y, local.z],
-		"rot": [0.0, randf() * TAU, 0.0]
-	}
-	data.next_id += 1
-	data.props.append(p)
-	_spawn_prop_node(chunk_nodes[coord], p)
-
-
-func _delete_at_cursor() -> void:
-	var hit := _raycast()
-	if hit.is_empty():
-		return
-	var body = hit.collider
-	if not (body is RigidBody3D and body.has_meta("id")):
-		return
-	var root: Node3D = body.get_parent()
-	var coord: Vector2i = root.get_meta("coord")
-	var id = body.get_meta("id")
-	var data: Dictionary = chunk_data[coord]
-	data.props = data.props.filter(func(p): return p.id != id)
-	body.queue_free()
-
-
 # ---------- Physgun ----------
-
-func _toggle_physgun() -> void:
-	physgun_enabled = not physgun_enabled
-	if not physgun_enabled:
-		_drop_held_prop()
-
 
 func _grab_at_cursor() -> void:
 	if is_instance_valid(held_prop):
@@ -711,75 +658,139 @@ func _raycast() -> Dictionary:
 # ---------- Character ----------
 
 func _build_character() -> void:
-	var shirt := _body_mat(Color(0.2, 0.45, 0.85))
-	var pants := _body_mat(Color(0.25, 0.25, 0.3))
-	var skin := _body_mat(Color(0.93, 0.76, 0.6))
-	var hair := _body_mat(Color(0.25, 0.15, 0.08))
-
 	model = Node3D.new()
 	player.add_child(model)
 
-	hips = Node3D.new()
-	hips.position.y = 0.95
-	model.add_child(hips)
+	var scene := load(MODEL_PATH) as PackedScene
+	if scene == null:
+		push_error("Player model not found at %s" % MODEL_PATH)
+		return
 
-	_box(hips, Vector3(0.45, 0.7, 0.25), Vector3(0, 0.35, 0), shirt)
-
-	head_pivot = Node3D.new()
-	head_pivot.position.y = 0.7
-	hips.add_child(head_pivot)
-	_box(head_pivot, Vector3(0.28, 0.28, 0.28), Vector3(0, 0.16, 0), skin)
-	_box(head_pivot, Vector3(0.3, 0.08, 0.3), Vector3(0, 0.3, 0), hair)
-
-	arm_l = Node3D.new()
-	arm_l.position = Vector3(-0.3, 0.65, 0)
-	hips.add_child(arm_l)
-	_box(arm_l, Vector3(0.14, 0.65, 0.14), Vector3(0, -0.33, 0), shirt)
-
-	arm_r = Node3D.new()
-	arm_r.position = Vector3(0.3, 0.65, 0)
-	hips.add_child(arm_r)
-	_box(arm_r, Vector3(0.14, 0.65, 0.14), Vector3(0, -0.33, 0), shirt)
-
-	leg_l = Node3D.new()
-	leg_l.position = Vector3(-0.12, 0, 0)
-	hips.add_child(leg_l)
-	_box(leg_l, Vector3(0.16, 0.95, 0.16), Vector3(0, -0.475, 0), pants)
-
-	leg_r = Node3D.new()
-	leg_r.position = Vector3(0.12, 0, 0)
-	hips.add_child(leg_r)
-	_box(leg_r, Vector3(0.16, 0.95, 0.16), Vector3(0, -0.475, 0), pants)
-
+	var inst := scene.instantiate()
+	model.add_child(inst)
+	model.rotation.y = PI  # change to 0 if the character faces away from the camera
 	model.visible = false
 
+	# Copy each surface material so the skin system can retexture it without touching the original.
+	for mi in _find_meshes(inst):
+		if mi.mesh == null:
+			continue
+		for i in mi.mesh.get_surface_count():
+			var src := mi.get_active_material(i) as StandardMaterial3D
+			if src == null:
+				continue
+			var m := src.duplicate() as StandardMaterial3D
+			mi.set_surface_override_material(i, m)
+			body_mats.append({"mat": m, "color": m.albedo_color, "base_tex": m.albedo_texture})
 
-func _box(parent: Node3D, size: Vector3, pos: Vector3, mat: Material) -> void:
-	var mi := MeshInstance3D.new()
-	var m := BoxMesh.new()
-	m.size = size
-	mi.mesh = m
-	mi.material_override = mat
-	mi.position = pos
-	parent.add_child(mi)
+	anim = _find_anim_player(inst)
+	if anim == null:
+		push_warning("Model has no AnimationPlayer, so animations are disabled")
+		return
+
+	# Keep playing while the pause menu is open so the Poses panel previews live.
+	anim.process_mode = Node.PROCESS_MODE_ALWAYS
+
+	for anim_name in anim.get_animation_list():
+		var a := anim.get_animation(anim_name)
+		a.loop_mode = Animation.LOOP_NONE if _is_one_shot(anim_name) else Animation.LOOP_LINEAR
+
+	anim_idle = _resolve_anim(["Idle_A"], "idle")
+	anim_walk = _resolve_anim(["Walk"], "walk")
+	anim_walk_back = _resolve_anim(["Walk_Backwards"], "backwards")
+	anim_run = _resolve_anim(["Run_Anime"], "run")
+	anim_jump = _resolve_anim(["Jump_2_RM"], "jump")
+
+	if anim_idle == "":
+		push_warning("No idle animation found in the model")
+	if anim_jump == "":
+		push_warning("No jump animation found in the model")
 
 
-func _animate_character(delta: float) -> void:
-	head_pivot.rotation.x = head.rotation.x
+func _is_one_shot(anim_name: String) -> bool:
+	var n := anim_name.to_lower()
+	return n.contains("jump") or n.contains("death") or n.contains("climbup")
 
-	var hspeed := Vector2(player.velocity.x, player.velocity.z).length()
-	var amp := clampf(hspeed / SPEED, 0.0, 1.0)
-	anim_phase += delta * hspeed * 1.6
-	var swing := sin(anim_phase) * 0.7 * amp
 
-	leg_l.rotation.x = swing
-	leg_r.rotation.x = -swing
-	arm_l.rotation.x = -swing * 0.8
-	arm_r.rotation.x = swing * 0.8
+# Prefers exact animation names, then falls back to a keyword match.
+func _resolve_anim(exact: Array, keyword: String) -> String:
+	for anim_name in exact:
+		if anim.has_animation(anim_name):
+			return anim_name
+	for anim_name in anim.get_animation_list():
+		if anim_name.to_lower().contains(keyword):
+			return anim_name
+	return ""
 
-	if not player.is_on_floor():
-		arm_l.rotation.x = -1.2
-		arm_r.rotation.x = -1.2
+
+func _find_anim_player(node: Node) -> AnimationPlayer:
+	if node is AnimationPlayer:
+		return node
+	for c in node.get_children():
+		var found := _find_anim_player(c)
+		if found:
+			return found
+	return null
+
+
+func _find_meshes(node: Node, out: Array = []) -> Array:
+	if node is MeshInstance3D:
+		out.append(node)
+	for c in node.get_children():
+		_find_meshes(c, out)
+	return out
+
+
+func _animate_character(_delta: float) -> void:
+	if anim == null:
+		return
+
+	if pose_override != "":
+		if anim.current_animation != pose_override:
+			anim.play(pose_override)
+		return
+
+	var vel := Vector3(player.velocity.x, 0.0, player.velocity.z)
+	var moving := vel.length() > 0.5
+	var local := player.global_basis.inverse() * vel
+
+	var target := ""
+	if not player.is_on_floor() and anim_jump != "":
+		target = anim_jump
+	elif moving:
+		if local.z > 0.5 and anim_walk_back != "":
+			target = anim_walk_back
+		elif sprinting and anim_run != "":
+			target = anim_run
+		elif anim_walk != "":
+			target = anim_walk
+	if target == "":
+		target = anim_idle
+	if target == "":
+		anim.stop()  # keeps the last pose
+		return
+
+	if anim.current_animation != target:
+		anim.play(target)
+
+
+# Used by the Poses panel in ui.gd.
+func get_pose_names() -> Array:
+	var out: Array = []
+	if anim:
+		for n in anim.get_animation_list():
+			out.append(n)
+	return out
+
+
+func set_pose(anim_name: String) -> void:
+	if anim and anim.has_animation(anim_name):
+		pose_override = anim_name
+		anim.play(anim_name)
+
+
+func clear_pose() -> void:
+	pose_override = ""
 
 
 func _toggle_third_person() -> void:
@@ -854,13 +865,6 @@ func _build_prop_assets() -> void:
 	prop_shapes = [bs, ss, cs]
 
 
-# Body material that the skin system can retexture. Keeps its base color for the Default skin.
-func _body_mat(c: Color) -> StandardMaterial3D:
-	var m := _mat(c)
-	body_mats.append({"mat": m, "color": c})
-	return m
-
-
 # Scans user://skins for images. Index 0 is always the built-in Default.
 func _scan_skins() -> void:
 	skin_files = ["Default"]
@@ -881,8 +885,12 @@ func _apply_skin(index: int) -> void:
 			skin_index = 0  # file failed to load, fall back to Default
 	for entry in body_mats:
 		var m: StandardMaterial3D = entry.mat
-		m.albedo_texture = tex
-		m.albedo_color = Color.WHITE if tex else entry.color
+		if tex:
+			m.albedo_texture = tex
+			m.albedo_color = Color.WHITE
+		else:
+			m.albedo_texture = entry.base_tex  # Default restores the model's own texture
+			m.albedo_color = entry.color
 
 
 func _load_skin_texture(file: String) -> Texture2D:
@@ -892,10 +900,6 @@ func _load_skin_texture(file: String) -> Texture2D:
 		return null
 	img.generate_mipmaps()
 	return ImageTexture.create_from_image(img)
-
-
-func _cycle_skin() -> void:
-	_apply_skin((skin_index + 1) % skin_files.size())
 
 
 # Procedural GMod-style flatgrass: bright green with fine speckle and no dark edges.
@@ -939,34 +943,6 @@ func _build_player() -> void:
 	_build_character()
 
 
-func _build_hud() -> void:
-	var layer := CanvasLayer.new()
-	hud = Label.new()
-	hud.position = Vector2(10, 10)
-	layer.add_child(hud)
-	add_child(layer)
-
-
-func _update_hud() -> void:
-	var tool_name: String = "Physgun" if physgun_enabled else str(TYPE_NAMES[current_type])
-	var tool_controls := "Left click: grab | Right click: drop | Wheel: adjust distance"
-	if not physgun_enabled:
-		tool_controls = "Left click: place | Right click: delete"
-
-	var hold_status := ""
-	if is_instance_valid(held_prop):
-		hold_status = "\nGrab distance: %.1f m" % physgun_hold_distance
-
-	hud.text = "Tool: %s (G to toggle; E changes prop type)\nWASD move | Space jump | V: camera view | Tab: texture library\n%s%s\nEsc: toggle mouse\nChunks loaded: %d | FPS: %d | Chunk: %s" % [
-		tool_name,
-		tool_controls,
-		hold_status,
-		chunk_nodes.size(),
-		Engine.get_frames_per_second(),
-		str(player_chunk)
-	]
-
-
 # ---------- Helpers ----------
 
 func _chunk_of(p: Vector3) -> Vector2i:
@@ -976,6 +952,6 @@ func _chunk_of(p: Vector3) -> Vector2i:
 func _chunk_origin(c: Vector2i) -> Vector3:
 	return Vector3(c.x * CHUNK_SIZE, 0.0, c.y * CHUNK_SIZE)
 
-	
+
 func _arr2v(a: Array) -> Vector3:
 	return Vector3(a[0], a[1], a[2])
